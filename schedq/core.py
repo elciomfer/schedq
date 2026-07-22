@@ -61,6 +61,7 @@ class Heap:
     def dkey(self, tid: str) -> None:
         idx = self._pos.get(tid)
         if idx is not None:
+            self._siftdown(idx)
             self._siftup(idx)
 
     def _pop(self, idx: int) -> Task:
@@ -109,6 +110,7 @@ class Schedq:
         self.runntask = None
         self.taskmap: dict[str, Task] = {}
         self.trigger = asyncio.Event()
+        self.actives: set[asyncio.Task] = set()
 
     def _runonloop(self, fn: typing.Callable[[], None]) -> None:
         if self.mainloop is None:
@@ -137,6 +139,12 @@ class Schedq:
         args: tuple = (),
         kwargs: typing.Optional[dict] = None,
     ):
+        if interval.total_seconds() < 1:
+            raise ValueError(
+                f"The minimum allowed interval is 1 second. "
+                f"Provided: {interval.total_seconds()}s for task '{name}'"
+            )
+
         newtask = Task(
             exectime=datetime.datetime.now() + interval,
             tid=tid,
@@ -168,9 +176,9 @@ class Schedq:
                 while attempt <= maxretries:
                     try:
                         if attempt == 0:
-                            log.info(f"[STEP RUNNING] {stepname}")
+                            log.info("[STEP RUNNING] %s", stepname)
                         else:
-                            log.warning(f"[STEP RETRY {attempt}/{maxretries}] {stepname}")
+                            log.warning("[STEP RETRY %d/%d] %s", attempt, maxretries, stepname)
 
                         if asyncio.iscoroutinefunction(func):
                             result = await func(*args, **kwargs)
@@ -179,16 +187,16 @@ class Schedq:
                             call = functools.partial(func, *args, **kwargs)
                             result = await loop.run_in_executor(None, call)
 
-                        log.info(f"[STEP SUCCESS] {stepname}")
+                        log.info("[STEP SUCCESS] %s", stepname)
                         return result
                     except Exception as err:
                         attempt += 1
                         if attempt > maxretries:
-                            log.error(f"[STEP FAILED DEFINITIVELY] {stepname} - Error: {err}")
+                            log.error("[STEP FAILED DEFINITIVELY] %s - Error: %s", stepname, err)
                             raise err
                         else:
                             backoff = retrydelay * (2 ** (attempt - 1))
-                            log.warning(f"[STEP FAILED] {stepname} - Waiting {backoff}s - Error: {err}")
+                            log.warning("[STEP FAILED] %s - Waiting %ss - Error: %s", stepname, backoff, err)
                             await asyncio.sleep(backoff)
             return wrapper
         return decorator
@@ -215,29 +223,96 @@ class Schedq:
         self.mainloop = asyncio.get_running_loop()
         self.runntask = asyncio.create_task(self._run())
 
-    def stop(self):
+    async def stop(self, wait: bool = True, timeout: typing.Optional[float] = None) -> None:
         if self.runntask:
             self.runntask.cancel()
+            try:
+                await self.runntask
+            except asyncio.CancelledError:
+                pass
+            self.runntask = None
+
+        if not self.actives:
+            return
+
+        pending = list(self.actives)
+
+        if not wait:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return
+
+        if timeout is None:
+            await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            done, still_pending = await asyncio.wait(pending, timeout=timeout)
+            if still_pending:
+                for t in still_pending:
+                    t.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
 
     def pause(self, tid: str):
-        if tid in self.taskmap:
-            self.taskmap[tid].ispaused = True
+        def _do():
+            task = self.taskmap.get(tid)
+            if task is not None:
+                task.ispaused = True
+                log.info("[PAUSED] Flow: %s - TID: %s", task.name, tid)
+            else:
+                log.warning("Attempted to pause unknown TID: %s", tid)
+        self._runonloop(_do)
 
     def resume(self, tid: str):
-        if tid in self.taskmap:
-            self.taskmap[tid].ispaused = False
+        def _do():
+            task = self.taskmap.get(tid)
+            if task is not None:
+                task.ispaused = False
+                log.info("[RESUMED] Flow: %s - TID: %s", task.name, tid)
+            else:
+                log.warning("Attempted to resume unknown TID: %s", tid)
+        self._runonloop(_do)
 
     def invoke(self, tid: str):
         def _do():
             task = self.taskmap.get(tid)
             if task is None:
+                log.warning("Attempted to invoke unknown TID: %s", tid)
                 return
+            
+            if task.ispaused:
+                log.warning("Cannot invoke paused Flow: %s (TID: %s). Resume it first.", task.name, tid)
+                return
+                
             task.exectime = datetime.datetime.now()
             self.minheap.dkey(tid)
             if self.mainloop:
                 self.trigger.set()
 
         self._runonloop(_do)
+        
+    def remove(self, tid: str):
+        def _do():
+            task = self.taskmap.pop(tid, None)
+            if task is not None:
+                self.minheap.remove(tid)
+                log.info("[REMOVED] Flow: %s - TID: %s", task.name, tid)
+            else:
+                log.warning("Attempted to remove unknown TID: %s", tid)
+        self._runonloop(_do)
+
+    def list(self) -> list[dict]:
+        return [
+            {
+                "tid": task.tid,
+                "name": task.name,
+                "next_run": task.exectime.isoformat(),
+                "interval_seconds": task.interval.total_seconds(),
+                "is_paused": task.ispaused,
+                "active_runs": task.activeruns,
+                "max_instances": task.maxinstances
+            }
+            for task in self.taskmap.values()
+        ]
 
     async def _callback(self, task: Task, eid: str):
         if asyncio.iscoroutinefunction(task.taskfunc):
@@ -263,7 +338,10 @@ class Schedq:
 
                 if not task.ispaused:
                     if task.maxinstances > 0 and task.activeruns >= task.maxinstances:
-                        log.warning(f"[SKIPPED] Flow: {task.name} - TID: {task.tid} - Reason: Limit reached ({task.activeruns}/{task.maxinstances})")
+                        log.warning(
+                            "[SKIPPED] Flow: %s - TID: %s - Reason: Limit reached (%d/%d)",
+                            task.name, task.tid, task.activeruns, task.maxinstances,
+                        )
                     else:
                         eid = str(uuid.uuid4())
 
@@ -275,33 +353,49 @@ class Schedq:
                                 while attempt <= t.maxretries:
                                     try:
                                         if attempt == 0:
-                                            log.info(f"[FLOW RUNNING] Flow: {t.name} - TID: {t.tid} - EID: {e}")
+                                            log.info("[FLOW RUNNING] Flow: %s - TID: %s - EID: %s", t.name, t.tid, e)
                                         else:
-                                            log.warning(f"[FLOW RETRY {attempt}/{t.maxretries}] Flow: {t.name} - TID: {t.tid} - EID: {e}")
+                                            log.warning(
+                                                "[FLOW RETRY %d/%d] Flow: %s - TID: %s - EID: %s",
+                                                attempt, t.maxretries, t.name, t.tid, e,
+                                            )
 
                                         await self._callback(t, e)
 
-                                        log.info(f"[FLOW SUCCESS] Flow: {t.name} - EID: {e}")
+                                        log.info("[FLOW SUCCESS] Flow: %s - EID: %s", t.name, e)
                                         break
 
                                     except Exception as err:
                                         attempt += 1
                                         if attempt > t.maxretries:
-                                            log.error(f"[FLOW FAILED DEFINITIVELY] Flow: {t.name} - EID: {e} - Error: {err}")
+                                            log.error(
+                                                "[FLOW FAILED DEFINITIVELY] Flow: %s - EID: %s - Error: %s",
+                                                t.name, e, err,
+                                            )
 
                                             t.ispaused = True
-                                            log.critical(f"[CIRCUIT BREAKER] Flow: {t.name} (TID: {t.tid}) It was paused to protect the system.")
+                                            log.critical(
+                                                "[CIRCUIT BREAKER] Flow: %s (TID: %s) It was paused to protect the system.",
+                                                t.name, t.tid,
+                                            )
                                         else:
                                             backoff = t.retrydelay * (2 ** (attempt - 1))
-                                            log.warning(f"[FLOW FAILED] Flow: {t.name} - Waiting {backoff}s - Error: {err}")
+                                            log.warning(
+                                                "[FLOW FAILED] Flow: %s - Waiting %ss - Error: %s",
+                                                t.name, backoff, err,
+                                            )
                                             await asyncio.sleep(backoff)
                             finally:
                                 t.activeruns -= 1
 
-                        asyncio.create_task(taskrun())
+                        runningtask = asyncio.create_task(taskrun())
+                        self.actives.add(runningtask)
+                        runningtask.add_done_callback(self.actives.discard)
 
                 task.exectime = now + task.interval
                 self.minheap.push(task)
+                
+                await asyncio.sleep(0)
             else:
                 leftover = (headtask.exectime - now).total_seconds()
 
