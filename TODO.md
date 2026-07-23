@@ -2,14 +2,16 @@
 
 List of features currently under development and future milestones.
 
-## Completed Milestones (v0.0.3)
+## Completed Milestones (v0.1.0)
 
+- [x] **Registry Pattern Architecture:** Extracted decorators to the global scope, enabling lazy loading and eliminating circular imports.
+- [x] **Data Context Isolation:** Implemented `contextvars` to safely pass Task IDs (TID) and Execution IDs (EID) across steps without explicit parameter passing, preventing data leaks.
+- [x] **Graceful Shutdown:** Validated async termination procedure that protects running threads and coroutines from sudden application kills.
+- [x] **Stress-Tested Engine:** Proven resilience processing millions of asynchronous and synchronous tasks concurrently with 0 memory leaks.
 - [x] **Optimized Custom Heap:** Replaced raw `heapq` with a custom pointer-based heap structure for O(1) updates and fast `invoke()`.
-- [x] **Code-as-Workflows (DAGs):** Introduced `@schedq.step` to compose modular and resilient pipelines inside flows.
+- [x] **Code-as-Workflows (DAGs):** Introduced `@step` to compose modular and resilient pipelines inside flows.
 - [x] **Fault Tolerance & Circuit Breaker:** Implemented Exponential Backoff retry policies and automated circuit-breaking for unstable tasks.
 - [x] **Concurrency Control:** Added `max_instances` throttling to prevent execution overlap.
-- [x] **Dynamic Arguments:** Full support for `*args` and `**kwargs` propagation in flows.
-- [x] **Thread-Safety & Non-Blocking I/O:** Isolated sync functions via `run_in_executor` and secured heap mutations across threads.
 
 ---
 
